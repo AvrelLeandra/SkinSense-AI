@@ -39,8 +39,8 @@ async function executeWithRetryAndFallback(contents: any, config: any, reqName: 
     return { _llmUnavailable: true };
   }
 
-  const models = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
-  const maxRetries = 5;
+  const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-flash-latest', 'gemini-pro-latest'];
+  const maxRetries = 3;
 
   for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
     const modelName = models[modelIndex];
@@ -61,20 +61,20 @@ async function executeWithRetryAndFallback(contents: any, config: any, reqName: 
         return cleanAndParseJSON(response.text || '');
       } catch (error: any) {
         const latency = Date.now() - startTime;
-        const is503 = error.status === 503 || (error.message && error.message.includes('503'));
+        const isRetriable = error.status === 503 || error.status === 429 || (error.message && (error.message.includes('503') || error.message.includes('429')));
         
-        console.error(`[${new Date().toISOString()}] ${reqName} ERROR | Model: ${modelName} | Retries: ${retryCount} | Latency: ${latency}ms | Code: ${error.status || 'Unknown'} | Error: ${error.message}\nStack: ${error.stack}`);
+        console.error(`[${new Date().toISOString()}] ${reqName} ERROR | Model: ${modelName} | Retries: ${retryCount} | Latency: ${latency}ms | Code: ${error.status || 'Unknown'} | Error: ${error.message}`);
         
-        if (is503 && retryCount < maxRetries) {
+        if (isRetriable && retryCount < maxRetries) {
           retryCount++;
-          const backoff = Math.pow(2, retryCount) * 1000; // 2s, 4s, 8s, 16s, 32s
-          console.log(`[${new Date().toISOString()}] Retrying ${reqName} in ${backoff}ms...`);
+          const backoff = Math.pow(2, retryCount) * 1000; // 2s, 4s, 8s
+          console.log(`[${new Date().toISOString()}] Retrying ${reqName} with ${modelName} in ${backoff}ms...`);
           await delay(backoff);
-        } else if (is503 && retryCount >= maxRetries) {
-          console.warn(`[${new Date().toISOString()}] Exhausted retries for model ${modelName} on 503 error.`);
+        } else if (isRetriable && retryCount >= maxRetries) {
+          console.warn(`[${new Date().toISOString()}] Exhausted retries for model ${modelName}. Switching models.`);
           break; // Try next model
         } else {
-          console.warn(`[${new Date().toISOString()}] Model ${modelName} failed with non-retriable error. Switching models if available.`);
+          console.warn(`[${new Date().toISOString()}] Model ${modelName} failed with non-retriable error. Switching models.`);
           break; // Try next model
         }
       }
@@ -475,12 +475,12 @@ Context of current user:
       { role: 'user', parts: [{ text: message }] }
     ];
 
-    const models = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-flash-latest', 'gemini-pro-latest'];
     let resultText = '';
 
     for (let i = 0; i < models.length; i++) {
       let retryCount = 0;
-      while (retryCount <= 5) {
+      while (retryCount <= 3) {
         try {
           const response = await client.models.generateContent({
             model: models[i],
@@ -490,11 +490,11 @@ Context of current user:
           resultText = response.text || '';
           break;
         } catch (error: any) {
-          const is503 = error.status === 503 || (error.message && error.message.includes('503'));
-          if (is503 && retryCount < 5) {
+          const isRetriable = error.status === 503 || error.status === 429 || (error.message && (error.message.includes('503') || error.message.includes('429')));
+          if (isRetriable && retryCount < 3) {
             retryCount++;
             await delay(Math.pow(2, retryCount) * 1000);
-          } else if (is503 && retryCount >= 5) {
+          } else if (isRetriable && retryCount >= 3) {
             break;
           } else {
             break;
