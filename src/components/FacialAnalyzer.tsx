@@ -46,7 +46,12 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
       if (ctx) {
         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/jpeg');
-        setImage(dataUrl);
+        
+        // Compress the selfie capture
+        compressImage(dataUrl).then((compressed) => {
+          setImage(compressed);
+        });
+
         // Stop stream
         const stream = videoRef.current.srcObject as MediaStream;
         stream?.getTracks().forEach(track => track.stop());
@@ -55,12 +60,60 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
     }
   };
 
+  const [error, setError] = useState<string | null>(null);
+
+  // Compress image to fit within limits and accelerate network uploads
+  const compressImage = (base64Str: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = base64Str;
+      img.onload = () => {
+        const maxWidth = 1024;
+        const maxHeight = 1024;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth || height > maxHeight) {
+          if (width > height) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          } else {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } else {
+          resolve(base64Str);
+        }
+      };
+      img.onerror = () => {
+        resolve(base64Str);
+      };
+    });
+  };
+
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = () => {
-        setImage(reader.result as string);
+      reader.onload = async () => {
+        setError(null);
+        try {
+          const rawBase = reader.result as string;
+          const compressed = await compressImage(rawBase);
+          setImage(compressed);
+        } catch (err) {
+          console.error("Compression error:", err);
+          setImage(reader.result as string);
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -72,6 +125,7 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
 
   const analyzeFace = async () => {
     setAnalyzing(true);
+    setError(null);
     try {
       // 1. Analyze face & lifestyle
       const analysisRes = await fetch('/api/analyze-face', {
@@ -79,7 +133,10 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image, questionnaire: questionnaireAnswers })
       });
-      if (!analysisRes.ok) throw new Error('Analysis failed');
+      if (!analysisRes.ok) {
+        const errData = await analysisRes.json().catch(() => ({}));
+        throw new Error(errData.error || 'Server responded with a facial analysis error.');
+      }
       const analysisData: FacialAnalysisResult = await analysisRes.json();
       setResult(analysisData);
       onAnalysisSaved(analysisData);
@@ -98,9 +155,13 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
         const recommendData = await recommendRes.json();
         setProducts(recommendData.products || []);
         setRoutine(recommendData.routine || null);
+      } else {
+        const errData = await recommendRes.json().catch(() => ({}));
+        console.warn('Routine recommendations warning:', errData.error);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setError(err.message || 'Facial analysis failed. Please verify connection or try again.');
     } finally {
       setAnalyzing(false);
     }
@@ -200,6 +261,16 @@ export default function FacialAnalyzer({ questionnaireAnswers, onAnalysisSaved }
                 </div>
               )}
             </div>
+
+            {error && (
+              <div className="mt-4 p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-start gap-2">
+                <Info className="shrink-0 mt-0.5 text-rose-500" size={14} />
+                <div>
+                  <p className="font-bold">Analysis Failed</p>
+                  <p className="mt-0.5 leading-relaxed">{error}</p>
+                </div>
+              </div>
+            )}
 
             {image && !result && (
               <button

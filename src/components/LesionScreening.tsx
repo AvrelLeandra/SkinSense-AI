@@ -30,9 +30,49 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
     duration: 'Less than 1 month'
   });
 
+  const [error, setError] = useState<string | null>(null);
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Compress image to fit within limits and accelerate network uploads
+  const compressImage = (base64Str: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = base64Str;
+      img.onload = () => {
+        const maxWidth = 1024;
+        const maxHeight = 1024;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth || height > maxHeight) {
+          if (width > height) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          } else {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } else {
+          resolve(base64Str);
+        }
+      };
+      img.onerror = () => {
+        resolve(base64Str);
+      };
+    });
+  };
 
   // Trigger file select
   const triggerFileSelect = () => {
@@ -44,9 +84,18 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = () => {
-        setImage(reader.result as string);
-        performQualityAssessment();
+      reader.onload = async () => {
+        setError(null);
+        try {
+          const rawBase = reader.result as string;
+          const compressed = await compressImage(rawBase);
+          setImage(compressed);
+          performQualityAssessment();
+        } catch (err) {
+          console.error("Compression error:", err);
+          setImage(reader.result as string);
+          performQualityAssessment();
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -57,6 +106,7 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
     setIsCameraActive(true);
     setImage(null);
     setResult(null);
+    setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
       if (videoRef.current) {
@@ -79,12 +129,17 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
       if (ctx) {
         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/jpeg');
-        setImage(dataUrl);
+        
+        // Compress capture snapshot
+        compressImage(dataUrl).then((compressed) => {
+          setImage(compressed);
+          performQualityAssessment();
+        });
+
         // Stop stream
         const stream = videoRef.current.srcObject as MediaStream;
         stream?.getTracks().forEach(track => track.stop());
         setIsCameraActive(false);
-        performQualityAssessment();
       }
     }
   };
@@ -102,6 +157,7 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
   const handleScreening = async () => {
     if (!image) return;
     setAnalyzing(true);
+    setError(null);
     try {
       const response = await fetch('/api/analyze-lesion', {
         method: 'POST',
@@ -113,12 +169,36 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
         setResult(data);
         onScanSaved(data);
       } else {
-        throw new Error('Analysis failed');
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Server responded with a screening error.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setError(err.message || 'Screening failed. Please verify connection or try again.');
     } finally {
       setAnalyzing(false);
+    }
+  };
+
+  const [retryingExplanation, setRetryingExplanation] = useState(false);
+  const retryExplanation = async () => {
+    if (!image || !result) return;
+    setRetryingExplanation(true);
+    try {
+      const response = await fetch('/api/analyze-lesion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image, symptoms })
+      });
+      if (response.ok) {
+        const data: SkinLesionResult = await response.json();
+        setResult(data);
+        onScanSaved(data);
+      }
+    } catch (err) {
+      console.error("Retry failed:", err);
+    } finally {
+      setRetryingExplanation(false);
     }
   };
 
@@ -398,6 +478,16 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
               </div>
             </div>
 
+            {error && (
+              <div className="mt-4 p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-start gap-2">
+                <AlertTriangle className="shrink-0 mt-0.5" size={14} />
+                <div>
+                  <p className="font-bold">Analysis Failed</p>
+                  <p className="mt-0.5">{error}</p>
+                </div>
+              </div>
+            )}
+
             {image && (
               <button
                 onClick={handleScreening}
@@ -492,7 +582,21 @@ export default function LesionScreening({ onScanSaved }: LesionScreeningProps) {
                     {/* Explanation */}
                     <div className="md:col-span-8 space-y-3">
                       <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Dermatological Assessment</h4>
-                      <p className="text-sm text-slate-600 leading-relaxed font-normal">{result.explanation}</p>
+                      {result.llmUnavailable ? (
+                        <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl">
+                          <p className="text-sm text-amber-800 font-medium">The AI explanation service is temporarily unavailable due to high demand. Your analysis results are available, and you can retry generating the explanation.</p>
+                          <button 
+                            onClick={retryExplanation}
+                            disabled={retryingExplanation}
+                            className="mt-3 px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50"
+                          >
+                            {retryingExplanation ? <RefreshCw className="animate-spin" size={14} /> : <RefreshCw size={14} />}
+                            {retryingExplanation ? 'Retrying...' : 'Retry Explanation'}
+                          </button>
+                        </div>
+                      ) : (
+                        <p className="text-sm text-slate-600 leading-relaxed font-normal">{result.explanation}</p>
+                      )}
                     </div>
                   </div>
 

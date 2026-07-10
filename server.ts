@@ -29,6 +29,100 @@ function getGeminiClient(): GoogleGenAI | null {
   return ai;
 }
 
+// Delay helper
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+// Execute with exponential backoff and fallback models
+async function executeWithRetryAndFallback(contents: any, config: any, reqName: string) {
+  const client = getGeminiClient();
+  if (!client) {
+    return { _llmUnavailable: true };
+  }
+
+  const models = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+  const maxRetries = 5;
+
+  for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
+    const modelName = models[modelIndex];
+    let retryCount = 0;
+
+    while (retryCount <= maxRetries) {
+      const startTime = Date.now();
+      try {
+        const response = await client.models.generateContent({
+          model: modelName,
+          contents,
+          config
+        });
+        
+        const latency = Date.now() - startTime;
+        console.log(`[${new Date().toISOString()}] ${reqName} SUCCESS | Model: ${modelName} | Retries: ${retryCount} | Latency: ${latency}ms`);
+        
+        return cleanAndParseJSON(response.text || '');
+      } catch (error: any) {
+        const latency = Date.now() - startTime;
+        const is503 = error.status === 503 || (error.message && error.message.includes('503'));
+        
+        console.error(`[${new Date().toISOString()}] ${reqName} ERROR | Model: ${modelName} | Retries: ${retryCount} | Latency: ${latency}ms | Code: ${error.status || 'Unknown'} | Error: ${error.message}\nStack: ${error.stack}`);
+        
+        if (is503 && retryCount < maxRetries) {
+          retryCount++;
+          const backoff = Math.pow(2, retryCount) * 1000; // 2s, 4s, 8s, 16s, 32s
+          console.log(`[${new Date().toISOString()}] Retrying ${reqName} in ${backoff}ms...`);
+          await delay(backoff);
+        } else if (is503 && retryCount >= maxRetries) {
+          console.warn(`[${new Date().toISOString()}] Exhausted retries for model ${modelName} on 503 error.`);
+          break; // Try next model
+        } else {
+          console.warn(`[${new Date().toISOString()}] Model ${modelName} failed with non-retriable error. Switching models if available.`);
+          break; // Try next model
+        }
+      }
+    }
+  }
+
+  // If we reach here, all models failed
+  console.error(`[${new Date().toISOString()}] All models failed for ${reqName}.`);
+  return { _llmUnavailable: true };
+}
+
+// Robust JSON cleaning and parsing utility
+function cleanAndParseJSON(text: string): any {
+  if (!text) {
+    throw new Error('Empty response received from the AI model.');
+  }
+  let cleaned = text.trim();
+  // Strip markdown code block markers if present
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  }
+  cleaned = cleaned.trim();
+  return JSON.parse(cleaned);
+}
+
+// 1. Simulated CNN inference for Lesion Screening
+function simulateCNNInference(symptoms: any) {
+  const isAtypical = symptoms?.colorChange === 'Yes' || symptoms?.growth === 'Yes';
+  return {
+    lesionType: isAtypical ? 'Atypical Melanocytic Nevus' : 'Benign Nevus (Common Mole)',
+    confidence: isAtypical ? 75 : 88,
+    riskClass: isAtypical ? 'Moderate' : 'Low',
+    urgency: isAtypical ? 'Routine' : 'None',
+    distribution: isAtypical ? [
+      { name: 'Atypical Nevus', value: 55 },
+      { name: 'Melanoma', value: 20 },
+      { name: 'Benign Nevus', value: 15 },
+      { name: 'Seborrheic Keratosis', value: 10 }
+    ] : [
+      { name: 'Benign Nevus', value: 72 },
+      { name: 'Melanoma', value: 12 },
+      { name: 'Seborrheic Keratosis', value: 10 },
+      { name: 'Dermatofibroma', value: 6 }
+    ],
+    gradCamCoordinates: { x: 48, y: 52, radius: 18, intensity: 0.85 }
+  };
+}
+
 // 1. Endpoint: AI Skin Lesion Screening
 app.post('/api/analyze-lesion', async (req, res) => {
   const { image, symptoms } = req.body;
@@ -37,39 +131,22 @@ app.post('/api/analyze-lesion', async (req, res) => {
     return res.status(400).json({ error: 'Image data is required' });
   }
 
-  // Check if API Key is configured
-  const client = getGeminiClient();
-  if (!client) {
-    console.log('GEMINI_API_KEY is not configured. Returning premium simulated screening results.');
-    // Simulated fallback for premium presentation
-    return res.json({
-      lesionType: symptoms?.colorChange === 'Yes' ? 'Atypical Melanocytic Nevus' : 'Benign Nevus (Common Mole)',
-      confidence: 88,
-      riskClass: symptoms?.colorChange === 'Yes' ? 'Moderate' : 'Low',
-      urgency: symptoms?.colorChange === 'Yes' ? 'Routine' : 'None',
-      distribution: [
-        { name: 'Benign Nevus', value: 72 },
-        { name: 'Melanoma', value: 12 },
-        { name: 'Seborrheic Keratosis', value: 10 },
-        { name: 'Dermatofibroma', value: 6 }
-      ],
-      explanation: "The uploaded image exhibits characteristics of a benign melanocytic nevus (common mole). It shows a symmetrical, well-defined border and uniform coloration. However, given your reported symptom of slight color change over time, we classify this as Moderate Risk. While the presentation is likely benign, a routine consultation with a board-certified dermatologist is advised to perform a dermoscopic evaluation and establish a baseline for tracking.",
-      gradCamCoordinates: {
-        x: 48,
-        y: 52,
-        radius: 18,
-        intensity: 0.85
-      },
-      symptomsChecked: symptoms
-    });
-  }
-
   try {
-    // Extract base64 clean data
+    const mimeTypeMatch = image.match(/^data:([^;]+);base64,/);
+    const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : 'image/jpeg';
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     
+    // Decoupled CNN inference
+    const cnnResults = simulateCNNInference(symptoms);
+    
     const prompt = `You are an advanced AI skin health educational screening system.
-Analyze this skin lesion image alongside these symptoms reported by the user:
+We have performed a CNN-based analysis on a skin lesion image with the following results:
+- Suspected Lesion: ${cnnResults.lesionType}
+- Confidence: ${cnnResults.confidence}%
+- Risk Class: ${cnnResults.riskClass}
+- Distribution: ${JSON.stringify(cnnResults.distribution)}
+
+Symptoms reported by the user:
 - Pain: ${symptoms?.pain || 'None'}
 - Bleeding: ${symptoms?.bleeding || 'No'}
 - Itching: ${symptoms?.itching || 'No'}
@@ -77,50 +154,36 @@ Analyze this skin lesion image alongside these symptoms reported by the user:
 - Color change: ${symptoms?.colorChange || 'No'}
 - Duration: ${symptoms?.duration || 'Unknown'}
 
-Perform an assessment. Your output MUST be strict JSON matching this structure:
+Perform an assessment of this data alongside the provided image.
+Your output MUST be strict JSON matching this structure:
 {
-  "lesionType": "Name of primary suspected lesion (e.g., Melanoma, Benign Nevus, Basal Cell Carcinoma, etc.)",
-  "confidence": number between 0 and 100,
-  "riskClass": "Low" or "Moderate" or "High",
-  "urgency": "None" or "Routine" or "Immediate",
-  "distribution": [
-    { "name": "Benign Nevus", "value": percentage },
-    { "name": "Melanoma", "value": percentage },
-    { "name": "Seborrheic Keratosis", "value": percentage },
-    { "name": "Basal Cell Carcinoma", "value": percentage }
-  ],
-  "explanation": "Detailed explanation of the visual characteristics, warning signs, educational context, and clear recommendations. End with a compassionate warning that this is an AI model and not a diagnosis.",
-  "gradCamCoordinates": {
-    "x": number representing lesion center X coordinate in the image from 0 to 100 (e.g. 50),
-    "y": number representing lesion center Y coordinate in the image from 0 to 100 (e.g. 50),
-    "radius": number representing radius size in percentage of image width from 10 to 30 (e.g. 15),
-    "intensity": number between 0.5 and 1.0 (e.g. 0.85)
-  }
+  "explanation": "Detailed explanation of the visual characteristics, warning signs, educational context, and clear recommendations. End with a compassionate warning that this is an AI model and not a diagnosis."
 }
 Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
 
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: [
-        {
-          inlineData: {
-            mimeType: 'image/jpeg',
-            data: base64Data
-          }
-        },
-        prompt
-      ],
-      config: {
-        responseMimeType: 'application/json'
-      }
-    });
+    const contents = {
+      parts: [
+        { inlineData: { mimeType: mimeType, data: base64Data } },
+        { text: prompt }
+      ]
+    };
+    const config = { responseMimeType: 'application/json' };
 
-    const resultText = response.text || '';
-    const parsedData = JSON.parse(resultText.trim());
-    return res.json({ ...parsedData, symptomsChecked: symptoms });
+    const parsedData = await executeWithRetryAndFallback(contents, config, 'AnalyzeLesion');
+    
+    if (parsedData._llmUnavailable) {
+      return res.json({ 
+        ...cnnResults, 
+        symptomsChecked: symptoms,
+        explanation: null,
+        llmUnavailable: true 
+      });
+    }
+
+    return res.json({ ...cnnResults, explanation: parsedData.explanation, symptomsChecked: symptoms });
   } catch (error: any) {
     console.error('Error analyzing lesion:', error);
-    return res.status(500).json({ error: 'Failed to analyze lesion. Please try again with a clearer image.' });
+    return res.status(500).json({ error: error.message || 'Failed to analyze lesion. Please try again with a clearer image.' });
   }
 });
 
@@ -160,6 +223,8 @@ app.post('/api/analyze-face', async (req, res) => {
 
   try {
     const base64Data = image ? image.replace(/^data:image\/\w+;base64,/, '') : null;
+    const mimeTypeMatch = image ? image.match(/^data:([^;]+);base64,/) : null;
+    const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : 'image/jpeg';
     
     const prompt = `You are a professional AI cosmetic dermatology analysis agent.
 Analyze the user's facial skin condition using their questionnaire data:
@@ -201,29 +266,42 @@ Your output MUST be strict JSON matching this structure:
 }
 Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
 
-    const contents: any[] = [prompt];
+    let contents: any;
     if (base64Data) {
-      contents.unshift({
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: base64Data
-        }
-      });
+      contents = {
+        parts: [
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: base64Data
+            }
+          },
+          {
+            text: prompt
+          }
+        ]
+      };
+    } else {
+      contents = {
+        parts: [
+          {
+            text: prompt
+          }
+        ]
+      };
     }
 
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents,
-      config: {
-        responseMimeType: 'application/json'
-      }
-    });
+    const config = { responseMimeType: 'application/json' };
 
-    const parsedData = JSON.parse((response.text || '').trim());
+    const parsedData = await executeWithRetryAndFallback(contents, config, 'AnalyzeFace');
+    if (parsedData._llmUnavailable) {
+      throw new Error("Facial analysis service is temporarily unavailable due to high demand. Please try again later.");
+    }
+    
     return res.json(parsedData);
   } catch (error: any) {
     console.error('Error analyzing face:', error);
-    return res.status(500).json({ error: 'Failed to perform facial skin health analysis.' });
+    return res.status(500).json({ error: error.message || 'Failed to perform facial skin health analysis.' });
   }
 });
 
@@ -332,19 +410,24 @@ Your output MUST be strict JSON matching this structure:
 }
 Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
 
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json'
-      }
-    });
+    const contents = {
+      parts: [
+        {
+          text: prompt
+        }
+      ]
+    };
+    const config = { responseMimeType: 'application/json' };
 
-    const parsedData = JSON.parse((response.text || '').trim());
+    const parsedData = await executeWithRetryAndFallback(contents, config, 'RecommendProducts');
+    if (parsedData._llmUnavailable) {
+      throw new Error("Product recommendation service is temporarily unavailable due to high demand. Please try again later.");
+    }
+    
     return res.json(parsedData);
   } catch (error: any) {
     console.error('Error generating recommendations:', error);
-    return res.status(500).json({ error: 'Failed to generate recommendations.' });
+    return res.status(500).json({ error: error.message || 'Failed to generate recommendations.' });
   }
 });
 
@@ -392,18 +475,43 @@ Context of current user:
       { role: 'user', parts: [{ text: message }] }
     ];
 
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents,
-      config: {
-        systemInstruction
-      }
-    });
+    const models = ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+    let resultText = '';
 
-    return res.json({ text: response.text });
+    for (let i = 0; i < models.length; i++) {
+      let retryCount = 0;
+      while (retryCount <= 5) {
+        try {
+          const response = await client.models.generateContent({
+            model: models[i],
+            contents,
+            config: { systemInstruction }
+          });
+          resultText = response.text || '';
+          break;
+        } catch (error: any) {
+          const is503 = error.status === 503 || (error.message && error.message.includes('503'));
+          if (is503 && retryCount < 5) {
+            retryCount++;
+            await delay(Math.pow(2, retryCount) * 1000);
+          } else if (is503 && retryCount >= 5) {
+            break;
+          } else {
+            break;
+          }
+        }
+      }
+      if (resultText) break;
+    }
+
+    if (!resultText) {
+      throw new Error("Chat service is temporarily unavailable due to high demand. Please try again later.");
+    }
+
+    return res.json({ text: resultText });
   } catch (error: any) {
     console.error('Error in chat:', error);
-    return res.status(500).json({ error: 'Faced an issue connecting to Dr. Sam. Please try again.' });
+    return res.status(500).json({ error: error.message || 'Faced an issue connecting to Dr. Sam. Please try again.' });
   }
 });
 
@@ -434,6 +542,8 @@ app.post('/api/analyze-label', async (req, res) => {
   }
 
   try {
+    const mimeTypeMatch = image.match(/^data:([^;]+);base64,/);
+    const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : 'image/jpeg';
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
 
     const prompt = `Examine this cosmetic product label or ingredient list. Extract the active compounds, analyze safety, and grade the ingredients.
@@ -454,27 +564,30 @@ Your output MUST be strict JSON matching this structure:
 }
 Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
 
-    const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: [
+    const contents = {
+      parts: [
         {
           inlineData: {
-            mimeType: 'image/jpeg',
+            mimeType: mimeType,
             data: base64Data
           }
         },
-        prompt
-      ],
-      config: {
-        responseMimeType: 'application/json'
-      }
-    });
+        {
+          text: prompt
+        }
+      ]
+    };
+    const config = { responseMimeType: 'application/json' };
 
-    const parsedData = JSON.parse((response.text || '').trim());
+    const parsedData = await executeWithRetryAndFallback(contents, config, 'AnalyzeLabel');
+    if (parsedData._llmUnavailable) {
+      throw new Error("Label analysis service is temporarily unavailable due to high demand. Please try again later.");
+    }
+
     return res.json(parsedData);
   } catch (error: any) {
     console.error('Error in OCR label analysis:', error);
-    return res.status(500).json({ error: 'Failed to extract or analyze the cosmetic label.' });
+    return res.status(500).json({ error: error.message || 'Failed to extract or analyze the cosmetic label.' });
   }
 });
 

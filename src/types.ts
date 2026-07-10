@@ -4,7 +4,8 @@ export interface SkinLesionResult {
   riskClass: 'Low' | 'Moderate' | 'High';
   urgency: 'None' | 'Routine' | 'Immediate';
   distribution: { name: string; value: number }[];
-  explanation: string;
+  explanation: string | null;
+  llmUnavailable?: boolean;
   gradCamCoordinates: {
     x: number; // percentage from left (0-100)
     y: number; // percentage from top (0-100)

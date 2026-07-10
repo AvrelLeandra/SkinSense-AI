@@ -17,8 +17,47 @@ export default function IngredientIntelligence() {
   const [ocrImage, setOcrImage] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [ocrResult, setOcrResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Compress image to fit within limits and accelerate network uploads
+  const compressImage = (base64Str: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = base64Str;
+      img.onload = () => {
+        const maxWidth = 1024;
+        const maxHeight = 1024;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth || height > maxHeight) {
+          if (width > height) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          } else {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } else {
+          resolve(base64Str);
+        }
+      };
+      img.onerror = () => {
+        resolve(base64Str);
+      };
+    });
+  };
 
   const filteredList = POPULAR_INGREDIENTS.filter(i =>
     i.name.toLowerCase().includes(searchQuery.toLowerCase())
@@ -33,9 +72,18 @@ export default function IngredientIntelligence() {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = () => {
-        setOcrImage(reader.result as string);
-        runOcrAnalysis(reader.result as string);
+      reader.onload = async () => {
+        setError(null);
+        try {
+          const rawBase = reader.result as string;
+          const compressed = await compressImage(rawBase);
+          setOcrImage(compressed);
+          runOcrAnalysis(compressed);
+        } catch (err) {
+          console.error("Compression error:", err);
+          setOcrImage(reader.result as string);
+          runOcrAnalysis(reader.result as string);
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -44,6 +92,7 @@ export default function IngredientIntelligence() {
   const runOcrAnalysis = async (base64Image: string) => {
     setScanning(true);
     setOcrResult(null);
+    setError(null);
     try {
       const response = await fetch('/api/analyze-label', {
         method: 'POST',
@@ -53,9 +102,13 @@ export default function IngredientIntelligence() {
       if (response.ok) {
         const data = await response.json();
         setOcrResult(data);
+      } else {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Server responded with a label analysis error.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setError(err.message || 'OCR Label Analysis failed. Please check connection or try again.');
     } finally {
       setScanning(false);
     }
@@ -285,6 +338,16 @@ export default function IngredientIntelligence() {
             />
 
             <AnimatePresence mode="wait">
+              {error && (
+                <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-start gap-2 mb-4">
+                  <AlertCircle className="shrink-0 mt-0.5 text-rose-500" size={14} />
+                  <div>
+                    <p className="font-bold">Scan Analysis Failed</p>
+                    <p className="mt-0.5 leading-relaxed">{error}</p>
+                  </div>
+                </div>
+              )}
+
               {scanning ? (
                 <div className="py-12 text-center space-y-3">
                   <RefreshCw className="animate-spin text-teal-500 mx-auto" size={32} />
