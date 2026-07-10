@@ -1,0 +1,6 @@
+{
+  "name": "SkinSense AI",
+  "description": "An AI-powered skin health companion providing skin lesion screening, facial health analysis, ingredient intelligence, and personalized skincare routine generation.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
