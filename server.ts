@@ -100,29 +100,6 @@ function cleanAndParseJSON(text: string): any {
   return JSON.parse(cleaned);
 }
 
-// 1. Simulated CNN inference for Lesion Screening
-function simulateCNNInference(symptoms: any) {
-  const isAtypical = symptoms?.colorChange === 'Yes' || symptoms?.growth === 'Yes';
-  return {
-    lesionType: isAtypical ? 'Atypical Melanocytic Nevus' : 'Benign Nevus (Common Mole)',
-    confidence: isAtypical ? 75 : 88,
-    riskClass: isAtypical ? 'Moderate' : 'Low',
-    urgency: isAtypical ? 'Routine' : 'None',
-    distribution: isAtypical ? [
-      { name: 'Atypical Nevus', value: 55 },
-      { name: 'Melanoma', value: 20 },
-      { name: 'Benign Nevus', value: 15 },
-      { name: 'Seborrheic Keratosis', value: 10 }
-    ] : [
-      { name: 'Benign Nevus', value: 72 },
-      { name: 'Melanoma', value: 12 },
-      { name: 'Seborrheic Keratosis', value: 10 },
-      { name: 'Dermatofibroma', value: 6 }
-    ],
-    gradCamCoordinates: { x: 48, y: 52, radius: 18, intensity: 0.85 }
-  };
-}
-
 // 1. Endpoint: AI Skin Lesion Screening
 app.post('/api/analyze-lesion', async (req, res) => {
   const { image, symptoms } = req.body;
@@ -134,23 +111,43 @@ app.post('/api/analyze-lesion', async (req, res) => {
   try {
     const mimeTypeMatch = image.match(/^data:([^;]+);base64,/);
     const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : 'image/jpeg';
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    
-    // Decoupled CNN inference
-    const cnnResults = simulateCNNInference(symptoms);
-    
-    const prompt = `You are an advanced AI skin health educational screening system.
-We have performed a CNN-based analysis on a skin lesion image with the following results:
-- Suspected Lesion: ${cnnResults.lesionType}
-- Confidence: ${cnnResults.confidence}%
-- Risk Class: ${cnnResults.riskClass}
-- Distribution: ${JSON.stringify(cnnResults.distribution)}
+    const base64Data = image.replace(/^data:([^;]+);base64,/, '');
 
-Symptoms reported by the user:
+    const cnnPrompt = `You are a medical AI vision model. Analyze this skin lesion image alongside these symptoms reported by the user:
 - Pain: ${symptoms?.pain || 'None'}
 - Bleeding: ${symptoms?.bleeding || 'No'}
 - Itching: ${symptoms?.itching || 'No'}
-- Growing: ${symptoms?.growth || 'No'}
+- Growth: ${symptoms?.growth || 'No'}
+- Color change: ${symptoms?.colorChange || 'No'}
+- Duration: ${symptoms?.duration || 'Unknown'}
+
+Perform an assessment. Your output MUST be strict JSON matching this structure:
+{
+  "lesionType": "Name of primary suspected lesion",
+  "confidence": number between 0 and 100,
+  "riskClass": "Low" or "Moderate" or "High",
+  "urgency": "None" or "Routine" or "Immediate",
+  "distribution": [
+    { "name": "Benign Nevus", "value": 72 },
+    { "name": "Melanoma", "value": 12 },
+    { "name": "Seborrheic Keratosis", "value": 10 },
+    { "name": "Basal Cell Carcinoma", "value": 6 }
+  ],
+  "gradCamCoordinates": {
+    "x": number representing lesion center X coordinate in the image from 0 to 100 (e.g. 50),
+    "y": number representing lesion center Y coordinate in the image from 0 to 100 (e.g. 50),
+    "radius": number representing radius size in percentage of image width from 10 to 30 (e.g. 15),
+    "intensity": number between 0.5 and 1.0 (e.g. 0.85)
+  }
+}
+Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
+
+    const explanationPrompt = `You are an advanced AI skin health educational screening system.
+Analyze this skin lesion image alongside these symptoms reported by the user:
+- Pain: ${symptoms?.pain || 'None'}
+- Bleeding: ${symptoms?.bleeding || 'No'}
+- Itching: ${symptoms?.itching || 'No'}
+- Growth: ${symptoms?.growth || 'No'}
 - Color change: ${symptoms?.colorChange || 'No'}
 - Duration: ${symptoms?.duration || 'Unknown'}
 
@@ -161,26 +158,47 @@ Your output MUST be strict JSON matching this structure:
 }
 Provide ONLY the JSON object. Do not include markdown codeblocks or extra text.`;
 
-    const contents = {
+    const cnnContents = {
       parts: [
         { inlineData: { mimeType: mimeType, data: base64Data } },
-        { text: prompt }
+        { text: cnnPrompt }
       ]
     };
+    
+    const explanationContents = {
+      parts: [
+        { inlineData: { mimeType: mimeType, data: base64Data } },
+        { text: explanationPrompt }
+      ]
+    };
+    
     const config = { responseMimeType: 'application/json' };
 
-    const parsedData = await executeWithRetryAndFallback(contents, config, 'AnalyzeLesion');
+    // Independent parallel requests
+    const [cnnParsedData, expParsedData] = await Promise.all([
+      executeWithRetryAndFallback(cnnContents, config, 'AnalyzeLesionCNN'),
+      executeWithRetryAndFallback(explanationContents, config, 'AnalyzeLesionExplanation')
+    ]);
     
-    if (parsedData._llmUnavailable) {
-      return res.json({ 
-        ...cnnResults, 
-        symptomsChecked: symptoms,
-        explanation: null,
-        llmUnavailable: true 
-      });
+    if (cnnParsedData._llmUnavailable) {
+      throw new Error("Analysis service is currently unavailable. Please try again later.");
+    }
+    
+    let explanation = null;
+    let llmUnavailable = false;
+    
+    if (expParsedData._llmUnavailable) {
+      llmUnavailable = true;
+    } else {
+      explanation = expParsedData.explanation;
     }
 
-    return res.json({ ...cnnResults, explanation: parsedData.explanation, symptomsChecked: symptoms });
+    return res.json({ 
+      ...cnnParsedData, 
+      explanation, 
+      llmUnavailable,
+      symptomsChecked: symptoms 
+    });
   } catch (error: any) {
     console.error('Error analyzing lesion:', error);
     return res.status(500).json({ error: error.message || 'Failed to analyze lesion. Please try again with a clearer image.' });
@@ -193,36 +211,11 @@ app.post('/api/analyze-face', async (req, res) => {
 
   const client = getGeminiClient();
   if (!client) {
-    console.log('GEMINI_API_KEY is not configured. Returning simulated facial analysis results.');
-    // Simulated fallback
-    return res.json({
-      skinType: questionnaire?.skinType || 'Combination',
-      overallScore: 84,
-      scores: {
-        acne: 85,
-        pigmentation: 80,
-        redness: 90,
-        wrinkles: 88,
-        pores: 75,
-        oiliness: 78,
-        hydration: 82,
-        sensitivity: 80
-      },
-      concerns: [
-        "Moderate T-zone oiliness leading to visible pores",
-        "Mild redness around cheeks (likely related to sun exposure)",
-        "Early indicators of fine expression lines near eyes"
-      ],
-      opportunities: [
-        "Incorporate Salicylic acid 2% BHA to regulate pore sebum",
-        "Use a broad-spectrum SPF 50 daily to tackle redness and pigmentation",
-        "Add Niacinamide to balance oil production and restore skin barrier"
-      ]
-    });
+    return res.status(500).json({ error: 'AI analysis service is not configured.' });
   }
 
   try {
-    const base64Data = image ? image.replace(/^data:image\/\w+;base64,/, '') : null;
+    const base64Data = image ? image.replace(/^data:([^;]+);base64,/, '') : null;
     const mimeTypeMatch = image ? image.match(/^data:([^;]+);base64,/) : null;
     const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : 'image/jpeg';
     
@@ -311,63 +304,7 @@ app.post('/api/recommend-products', async (req, res) => {
 
   const client = getGeminiClient();
   if (!client) {
-    console.log('GEMINI_API_KEY is not configured. Returning premium simulated recommendations.');
-    return res.json({
-      products: [
-        {
-          name: "Effaclar Purifying Foaming Gel",
-          brand: "La Roche-Posay",
-          category: "Cleanser",
-          priceCategory: "Mid-Range",
-          priceRange: "$22.00",
-          ingredients: ["Salicylic Acid", "Zinc PCA", "Thermal Spring Water"],
-          instructions: "Gently massage onto wet face morning and night. Rinse thoroughly.",
-          timeOfDay: "Both",
-          expectedResults: "Cleanses skin, eliminates impurities, and controls excess oil.",
-          precautions: "Avoid contact with eyes. If dryness occurs, reduce to once daily."
-        },
-        {
-          name: "CeraVe PM Facial Moisturizing Lotion",
-          brand: "CeraVe",
-          category: "Moisturizer",
-          priceCategory: "Budget",
-          priceRange: "$15.99",
-          ingredients: ["Ceramides", "Niacinamide", "Hyaluronic Acid"],
-          instructions: "Apply liberally to the face and neck at night after serums.",
-          timeOfDay: "Night",
-          expectedResults: "Restores the skin's protective barrier and locks in hydration.",
-          precautions: "None. Suitable for sensitive and acne-prone skin."
-        },
-        {
-          name: "C-Firma Fresh Day Serum",
-          brand: "Drunk Elephant",
-          category: "Serum",
-          priceCategory: "Premium",
-          priceRange: "$78.00",
-          ingredients: ["L-Ascorbic Acid (15%)", "Ferulic Acid", "Vitamin E"],
-          instructions: "Apply 1-2 pumps to clean, dry face and neck in the morning.",
-          timeOfDay: "Morning",
-          expectedResults: "Brightens skin tone, reduces pigmentation, and combats photo-aging.",
-          precautions: "Store in a cool, dark place to avoid oxidation. Always pair with sunscreen."
-        }
-      ],
-      routine: {
-        morning: [
-          { step: 1, title: "Cleanser", productName: "Effaclar Purifying Foaming Gel", instructions: "Cleanse face with lukewarm water to remove overnight sebum." },
-          { step: 2, title: "Serum", productName: "C-Firma Fresh Day Serum", instructions: "Apply to dry skin. Let it absorb for 3 minutes for maximum antioxidant uptake." },
-          { step: 3, title: "Moisturizer & SPF", productName: "Daily Shield Broad Spectrum SPF 50", instructions: "Protect skin from active UV rays. Essential when using active serums." }
-        ],
-        night: [
-          { step: 1, title: "Cleanser", productName: "Effaclar Purifying Foaming Gel", instructions: "Double-cleanse if you wore heavy makeup or sweat during the day." },
-          { step: 2, title: "Moisturizer", productName: "CeraVe PM Facial Moisturizing Lotion", instructions: "Apply a generous layer to rebuild skin barrier overnight." }
-        ],
-        weekly: [
-          "Exfoliate with 2% Salicylic Acid on Wednesday and Sunday nights only.",
-          "Use a calming Hydrating Sheet Mask on Friday night for skin recovery."
-        ],
-        seasonalTips: "During dry seasons or winter, swap the foaming gel cleanser for a hydrating cream cleanser, and add a drop of squalane oil into your evening cream."
-      }
-    });
+    return res.status(500).json({ error: 'AI recommendation service is not configured.' });
   }
 
   try {
